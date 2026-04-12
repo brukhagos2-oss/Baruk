@@ -1,0 +1,35 @@
+import os
+import telebot
+from flask import Flask
+from threading import Thread
+
+# የቴሌግራም ቶከን (Render ላይ በድብቅ እናስገባዋለን)
+TOKEN = os.getenv('BOT_TOKEN')
+bot = telebot.TeleBot(TOKEN)
+
+# Render እንዳይዘጋው (Keep-alive) የሚሆን ሰርቨር
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "ቦቱ ነቅቷል!"
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "ሰላም Bruk! የትሬዲንግ ቦቱ በRender ላይ 24 ሰዓት ለመስራት ዝግጁ ነው።")
+
+@bot.message_handler(commands=['signal'])
+def send_signal(message):
+    # እዚህ ጋር ለወደፊቱ የንግድ ስሌቶችህን እንጨምራለን
+    bot.reply_to(message, "የገበያ ሁኔታን በመተንተን ላይ ነኝ...")
+
+def start_bot():
+    bot.infinity_polling()
+
+if __name__ == "__main__":
+    t = Thread(target=run)
+    t.start()
+    start_bot()
