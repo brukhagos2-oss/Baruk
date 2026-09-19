@@ -1,24 +1,29 @@
-import { desc, isNull, sql } from "drizzle-orm";
-
-import { db } from "@/db";
-import { alerts } from "@/db/schema";
+import { getSettings, runBacktest } from "@/lib/engine";
+import { isInstrument, isTimeframe } from "@/lib/market/instruments";
+import { MODES, type EngineMode } from "@/lib/strategy";
 
 export const dynamic = "force-dynamic";
+export const maxDuration = 60;
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
-  const limit = Math.min(Number(url.searchParams.get("limit") ?? 30), 100);
-  const [rows, [unread]] = await Promise.all([
-    db.select().from(alerts).orderBy(desc(alerts.createdAt)).limit(limit),
-    db
-      .select({ count: sql<number>`cast(count(*) as int)` })
-      .from(alerts)
-      .where(isNull(alerts.readAt)),
-  ]);
-  return Response.json({ alerts: rows, unread: unread?.count ?? 0 });
-}
+  const instrument = url.searchParams.get("instrument") ?? "XAUUSD";
+  const tf = url.searchParams.get("tf") ?? "M15";
+  if (!isInstrument(instrument) || !isTimeframe(tf)) {
+    return Response.json({ error: "Unknown instrument or timeframe" }, { status: 400 });
+  }
+  const settings = await getSettings();
+  const modeParam = url.searchParams.get("mode");
+  const mode: EngineMode = modeParam && modeParam in MODES ? (modeParam as EngineMode) : settings.mode;
+  const minConfidence = Number(url.searchParams.get("minConfidence") ?? settings.minConfidence);
 
-export async function POST() {
-  await db.update(alerts).set({ readAt: new Date() }).where(isNull(alerts.readAt));
-  return Response.json({ ok: true });
+  try {
+    const result = await runBacktest(instrument, tf, mode, minConfidence);
+    return Response.json(result);
+  } catch (error) {
+    return Response.json(
+      { error: error instanceof Error ? error.message : "Backtest failed" },
+      { status: 500 },
+    );
+  }
 }
