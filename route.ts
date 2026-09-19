@@ -1,80 +1,32 @@
-import { and, desc, eq, inArray } from "drizzle-orm";
-
-import { db } from "@/db";
-import { signals } from "@/db/schema";
-import { getSettings, getSnapshot } from "@/lib/engine";
-import { getCandles } from "@/lib/market/candles";
-import { isInstrument, isTimeframe, INSTRUMENTS, TIMEFRAMES } from "@/lib/market/instruments";
-import { ema } from "@/lib/indicators";
+import { getSettings, saveSettings, type EngineSettings } from "@/lib/engine";
+import { isInstrument, isTimeframe } from "@/lib/market/instruments";
+import { MODES, type EngineMode } from "@/lib/strategy";
 
 export const dynamic = "force-dynamic";
 
-export async function GET(request: Request) {
-  const url = new URL(request.url);
-  const instrumentParam = url.searchParams.get("instrument") ?? "XAUUSD";
-  const tfParam = url.searchParams.get("tf") ?? "M15";
-  if (!isInstrument(instrumentParam) || !isTimeframe(tfParam)) {
-    return Response.json({ error: "Unknown instrument or timeframe" }, { status: 400 });
+export async function GET() {
+  const settings = await getSettings();
+  return Response.json({ settings, modes: MODES });
+}
+
+export async function POST(request: Request) {
+  const body = (await request.json()) as Partial<EngineSettings>;
+  const patch: Partial<EngineSettings> = {};
+
+  if (typeof body.minConfidence === "number") patch.minConfidence = body.minConfidence;
+  if (typeof body.autoScan === "boolean") patch.autoScan = body.autoScan;
+  if (typeof body.pushEnabled === "boolean") patch.pushEnabled = body.pushEnabled;
+  if (typeof body.soundEnabled === "boolean") patch.soundEnabled = body.soundEnabled;
+  if (typeof body.riskPerTrade === "number") patch.riskPerTrade = Math.max(0.1, Math.min(10, body.riskPerTrade));
+  if (typeof body.accountSize === "number") patch.accountSize = Math.max(100, body.accountSize);
+  if (typeof body.mode === "string" && body.mode in MODES) {
+    const mode = body.mode as EngineMode;
+    patch.mode = mode;
+    if (typeof body.minConfidence !== "number") patch.minConfidence = MODES[mode].minConfidence;
   }
+  if (Array.isArray(body.instruments)) patch.instruments = body.instruments.filter(isInstrument);
+  if (Array.isArray(body.timeframes)) patch.timeframes = body.timeframes.filter(isTimeframe);
 
-  try {
-    const settings = await getSettings();
-    const [series, snapshot] = await Promise.all([
-      getCandles(instrumentParam, tfParam),
-      getSnapshot(instrumentParam, tfParam, settings.mode, settings.minConfidence),
-    ]);
-
-    const closes = series.candles.map((c) => c.close);
-    const e21 = ema(closes, 21);
-    const e50 = ema(closes, 50);
-    const e200 = ema(closes, 200);
-    const view = series.candles.slice(-320);
-    const offset = series.candles.length - view.length;
-
-    const [active] = await db
-      .select()
-      .from(signals)
-      .where(
-        and(
-          eq(signals.instrument, instrumentParam),
-          eq(signals.timeframe, tfParam),
-          eq(signals.status, "OPEN"),
-        ),
-      )
-      .orderBy(desc(signals.createdAt))
-      .limit(1);
-
-    const [lastClosed] = await db
-      .select()
-      .from(signals)
-      .where(
-        and(
-          eq(signals.instrument, instrumentParam),
-          eq(signals.timeframe, tfParam),
-          inArray(signals.status, ["TP", "SL", "EXPIRED"]),
-        ),
-      )
-      .orderBy(desc(signals.signalBarTime))
-      .limit(1);
-
-    return Response.json({
-      instrument: INSTRUMENTS[instrumentParam],
-      timeframe: TIMEFRAMES[tfParam],
-      candles: view,
-      overlays: {
-        ema21: view.map((c, i) => ({ time: c.time, value: e21[offset + i] })).filter((p) => Number.isFinite(p.value)),
-        ema50: view.map((c, i) => ({ time: c.time, value: e50[offset + i] })).filter((p) => Number.isFinite(p.value)),
-        ema200: view.map((c, i) => ({ time: c.time, value: e200[offset + i] })).filter((p) => Number.isFinite(p.value)),
-      },
-      snapshot,
-      activeSignal: active ?? null,
-      lastClosedSignal: lastClosed ?? null,
-      feed: { source: series.source, provider: series.provider, fetchedAt: series.fetchedAt },
-    });
-  } catch (error) {
-    return Response.json(
-      { error: error instanceof Error ? error.message : "Market feed unavailable" },
-      { status: 500 },
-    );
-  }
+  const settings = await saveSettings(patch);
+  return Response.json({ settings });
 }
