@@ -1,32 +1,49 @@
-import { getSettings, saveSettings, type EngineSettings } from "@/lib/engine";
-import { isInstrument, isTimeframe } from "@/lib/market/instruments";
-import { MODES, type EngineMode } from "@/lib/strategy";
+import { desc, eq, inArray } from "drizzle-orm";
+
+import { db } from "@/db";
+import { signals } from "@/db/schema";
+import { getPerformance } from "@/lib/engine";
+import { getCandles } from "@/lib/market/candles";
+import { isInstrument, isTimeframe, toPips } from "@/lib/market/instruments";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
-  const settings = await getSettings();
-  return Response.json({ settings, modes: MODES });
-}
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const limit = Math.min(Number(url.searchParams.get("limit") ?? 40), 200);
 
-export async function POST(request: Request) {
-  const body = (await request.json()) as Partial<EngineSettings>;
-  const patch: Partial<EngineSettings> = {};
+  const [open, history, performance] = await Promise.all([
+    db.select().from(signals).where(eq(signals.status, "OPEN")).orderBy(desc(signals.createdAt)),
+    db
+      .select()
+      .from(signals)
+      .where(inArray(signals.status, ["TP", "SL", "EXPIRED"]))
+      .orderBy(desc(signals.closedAt))
+      .limit(limit),
+    getPerformance(),
+  ]);
 
-  if (typeof body.minConfidence === "number") patch.minConfidence = body.minConfidence;
-  if (typeof body.autoScan === "boolean") patch.autoScan = body.autoScan;
-  if (typeof body.pushEnabled === "boolean") patch.pushEnabled = body.pushEnabled;
-  if (typeof body.soundEnabled === "boolean") patch.soundEnabled = body.soundEnabled;
-  if (typeof body.riskPerTrade === "number") patch.riskPerTrade = Math.max(0.1, Math.min(10, body.riskPerTrade));
-  if (typeof body.accountSize === "number") patch.accountSize = Math.max(100, body.accountSize);
-  if (typeof body.mode === "string" && body.mode in MODES) {
-    const mode = body.mode as EngineMode;
-    patch.mode = mode;
-    if (typeof body.minConfidence !== "number") patch.minConfidence = MODES[mode].minConfidence;
-  }
-  if (Array.isArray(body.instruments)) patch.instruments = body.instruments.filter(isInstrument);
-  if (Array.isArray(body.timeframes)) patch.timeframes = body.timeframes.filter(isTimeframe);
+  // Live floating P/L for every open idea, priced off the same feed as the chart.
+  const live = await Promise.all(
+    open.map(async (sig) => {
+      if (!isInstrument(sig.instrument) || !isTimeframe(sig.timeframe)) {
+        return { ...sig, livePrice: sig.entry, floatingPips: 0, progress: 0 };
+      }
+      try {
+        const series = await getCandles(sig.instrument, sig.timeframe);
+        const price = series.livePrice;
+        const long = sig.direction === "BUY";
+        const raw = long ? price - sig.entry : sig.entry - price;
+        const floatingPips = toPips(sig.instrument, raw) * (raw >= 0 ? 1 : -1);
+        const span = long ? sig.takeProfit - sig.stopLoss : sig.stopLoss - sig.takeProfit;
+        const travelled = long ? price - sig.stopLoss : sig.stopLoss - price;
+        const progress = span > 0 ? Math.max(0, Math.min(1, travelled / span)) : 0;
+        return { ...sig, livePrice: price, floatingPips, progress };
+      } catch {
+        return { ...sig, livePrice: sig.entry, floatingPips: 0, progress: 0 };
+      }
+    }),
+  );
 
-  const settings = await saveSettings(patch);
-  return Response.json({ settings });
+  return Response.json({ open: live, history, performance });
 }
